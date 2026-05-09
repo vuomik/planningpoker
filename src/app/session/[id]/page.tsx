@@ -2,8 +2,9 @@
 
 import { use, useEffect, useState, useRef } from 'react';
 import { useRouter } from 'next/navigation';
+import Pusher from 'pusher-js';
 
-type Player = { name: string; vote: string | null };
+type Player = { name: string; vote: string | null; lastSeen?: number };
 type SessionState = { players: Record<string, Player>; isRevealed: boolean };
 
 const FIBONACCI = ['0', '1', '2', '3', '5', '8', '13', '21', '34', '55', '89', '?', '☕'];
@@ -19,14 +20,28 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
   const [state, setState] = useState<SessionState>({ players: {}, isRevealed: false });
   const [myVote, setMyVote] = useState<string | null>(null);
 
-  const eventSourceRef = useRef<EventSource | null>(null);
+  const isHostRef = useRef(isHost);
+  const stateRef = useRef(state);
+  const nameRef = useRef(name);
+
+  useEffect(() => { isHostRef.current = isHost; }, [isHost]);
+  useEffect(() => { stateRef.current = state; }, [state]);
+  useEffect(() => { nameRef.current = name; }, [name]);
 
   useEffect(() => {
-    // Check if user is host
     const hostFlag = localStorage.getItem(`host_${sessionId}`);
-    if (hostFlag) setIsHost(true);
+    if (hostFlag) {
+      setIsHost(true);
+      const savedState = localStorage.getItem(`state_${sessionId}`);
+      if (savedState) {
+        try {
+          setState(JSON.parse(savedState));
+        } catch (e) {
+          // invalid JSON
+        }
+      }
+    }
 
-    // Check if user already has a name stored for this session
     const storedName = localStorage.getItem(`name_${sessionId}`);
     if (storedName) {
       setName(storedName);
@@ -35,40 +50,125 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
 
     return () => {
       if (storedName) leaveSession(storedName);
-      if (eventSourceRef.current) eventSourceRef.current.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
+
+  useEffect(() => {
+    if (!hasJoined) return;
+
+    const pusher = new Pusher(process.env.NEXT_PUBLIC_PUSHER_KEY!, {
+      cluster: process.env.NEXT_PUBLIC_PUSHER_CLUSTER!
+    });
+
+    const channel = pusher.subscribe(`session-${sessionId}`);
+
+    channel.bind('poker-event', (data: any) => {
+      if (isHostRef.current) {
+        handleEventAsHost(data);
+      } else {
+        if (data.action === 'sync') {
+          setState(data.state);
+          if (nameRef.current && data.state.players[nameRef.current]) {
+            setMyVote(data.state.players[nameRef.current].vote);
+          }
+        }
+      }
+    });
+
+    // Start Ping interval
+    const pingInterval = setInterval(() => {
+      fetch(`/api/session/${sessionId}/action`, {
+        method: 'POST',
+        body: JSON.stringify({ action: 'ping', name: nameRef.current })
+      });
+    }, 10000);
+
+    return () => {
+      clearInterval(pingInterval);
+      channel.unbind_all();
+      pusher.unsubscribe(`session-${sessionId}`);
+      pusher.disconnect();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasJoined, sessionId]);
+
+  const syncState = async (stateToSync: SessionState) => {
+    localStorage.setItem(`state_${sessionId}`, JSON.stringify(stateToSync));
+    await fetch(`/api/session/${sessionId}/action`, {
+      method: 'POST',
+      body: JSON.stringify({ action: 'sync', state: stateToSync })
+    });
+  };
+
+  const handleEventAsHost = (data: any) => {
+    // If it's just a sync echoed back to us, ignore it
+    if (data.action === 'sync') return;
+
+    const newState = { 
+      ...stateRef.current, 
+      players: { ...stateRef.current.players } 
+    };
+    let shouldSync = false;
+
+    switch (data.action) {
+      case 'join':
+      case 'ping':
+        if (data.name) {
+          if (!newState.players[data.name]) {
+            newState.players[data.name] = { name: data.name, vote: null, lastSeen: Date.now() };
+          } else {
+            newState.players[data.name].lastSeen = Date.now();
+          }
+          shouldSync = true;
+        }
+        break;
+      case 'vote':
+        if (data.name && newState.players[data.name]) {
+          newState.players[data.name].vote = data.vote;
+          newState.players[data.name].lastSeen = Date.now();
+          shouldSync = true;
+        }
+        break;
+      case 'leave':
+        if (data.name && newState.players[data.name]) {
+          delete newState.players[data.name];
+          shouldSync = true;
+        }
+        break;
+    }
+
+    if (shouldSync) {
+      setState(newState);
+      syncState(newState);
+      
+      // Update our own vote state if we were the ones voting
+      if (data.name === nameRef.current && data.action === 'vote') {
+          setMyVote(data.vote);
+      }
+    }
+  };
 
   const joinSession = async (playerName: string) => {
     localStorage.setItem(`name_${sessionId}`, playerName);
     setName(playerName);
     setHasJoined(true);
 
-    await fetch(`/api/session/${sessionId}/action`, {
-      method: 'POST',
-      body: JSON.stringify({ action: 'join', name: playerName })
-    });
-
-    if (!eventSourceRef.current) {
-      const source = new EventSource(`/api/session/${sessionId}/events`);
-      source.onmessage = (e) => {
-        const data = JSON.parse(e.data);
-        setState(data);
-        if (data.players[playerName]) {
-            setMyVote(data.players[playerName].vote);
-        }
-      };
-      eventSourceRef.current = source;
+    // If host is joining for the first time, immediately sync state to get started
+    if (isHostRef.current) {
+        // give it a tiny delay to allow pusher subscription to setup, then we join ourselves.
+        setTimeout(async () => {
+             await fetch(`/api/session/${sessionId}/action`, {
+              method: 'POST',
+              body: JSON.stringify({ action: 'join', name: playerName })
+            });
+        }, 500);
+    } else {
+        await fetch(`/api/session/${sessionId}/action`, {
+          method: 'POST',
+          body: JSON.stringify({ action: 'join', name: playerName })
+        });
     }
-
-    // Start Ping interval to stay alive
-    setInterval(() => {
-      fetch(`/api/session/${sessionId}/action`, {
-        method: 'POST',
-        body: JSON.stringify({ action: 'ping', name: playerName })
-      });
-    }, 10000);
   };
 
   const leaveSession = async (playerName: string) => {
@@ -80,25 +180,27 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
 
   const submitVote = async (value: string) => {
     const newVote = myVote === value ? null : value; // toggle vote
+    // Optimistic UI update (will be corrected by sync if needed)
     setMyVote(newVote);
     await fetch(`/api/session/${sessionId}/action`, {
       method: 'POST',
-      body: JSON.stringify({ action: 'vote', name, vote: newVote })
+      body: JSON.stringify({ action: 'vote', name: nameRef.current, vote: newVote })
     });
   };
 
   const flipCards = async () => {
-    await fetch(`/api/session/${sessionId}/action`, {
-      method: 'POST',
-      body: JSON.stringify({ action: 'flip' })
-    });
+    const newState = { ...stateRef.current, isRevealed: true };
+    setState(newState);
+    syncState(newState);
   };
 
   const resetRound = async () => {
-    await fetch(`/api/session/${sessionId}/action`, {
-      method: 'POST',
-      body: JSON.stringify({ action: 'reset' })
-    });
+    const newState = { ...stateRef.current, isRevealed: false };
+    for (const p in newState.players) {
+      newState.players[p].vote = null;
+    }
+    setState(newState);
+    syncState(newState);
   };
 
   if (!hasJoined) {
